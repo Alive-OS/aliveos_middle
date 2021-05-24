@@ -72,7 +72,7 @@ class Data2ConceptInterpreter:
 
     def device_data_handler(self, data: msg.DeviceData):
         dev_name = f"{data.data_source}:{data.data_type}"
-        logdebug(f"Received from {dev_name} - {data.data_value}")
+        logdebug(f"dev ->d2c : {dev_name} - {data.data_value}")
         # Emotion Core
         m = srv.EmotionCoreWriteRequest()
         m.sensor_name = dev_name
@@ -96,7 +96,7 @@ class Data2ConceptInterpreter:
                 if not r:
                     break
             if r:
-                logdebug("Concept is: %s" % concept)
+                logdebug("dev -> d2c concept: %s" % concept)
                 self.publish_perception_concept_to_egos(symbol=concept, modifier="")
 
     def handler_perception_concetps_dsc(self, req: srv.PerceptionConceptDescriptorRequest) -> \
@@ -125,7 +125,7 @@ class Data2ConceptInterpreter:
                                                                service=srv.EmotionCoreDataDescriptor)
         self.server_of_perception_concept_dsc = ar.get.server(name=get_param("SRV_D2C_PCDSC"),
                                                               service=srv.PerceptionConceptDescriptor,
-                                                              handle=self.handler_perception_concetps_dsc)
+                                                              handler=self.handler_perception_concetps_dsc)
 
     def start(self):
         init_node(name=self.__class__.__name__, anonymous=False)

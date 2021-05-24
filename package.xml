@@ -2,7 +2,7 @@
 <package format="2">
 
   <name>aliveos_middle</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>The aliveos_middle package</description>
 
   <author email="mail@agramakov.me">Andrei Gramakov</author>
@@ -23,6 +23,7 @@
   <build_export_depend>std_msgs</build_export_depend>
 
   <exec_depend>aliveos_msgs</exec_depend>
+  <exec_depend version_gte="0.1.0">aliveos_py</exec_depend>
   <exec_depend>message_runtime</exec_depend>
   <exec_depend>roscpp</exec_depend>
   <exec_depend>rospy</exec_depend>

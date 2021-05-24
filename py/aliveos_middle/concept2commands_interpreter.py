@@ -20,66 +20,111 @@
 #
 # *************************************************************************
 
-from typing import Union
 from threading import Lock
+from time import sleep
+from typing import Union
 
 from rospy import logdebug, logerr, loginfo, logwarn, init_node, Service, spin
-from rosparam import get_param
 
-from aliveos_py import ros as ar
-from aliveos_msgs import msg, srv
 from aliveos_app import node_types
-from aliveos_py.helpers.json_tools import json_to_dict
+from aliveos_app.ego_node import EGO_COMMANDS
+from aliveos_msgs import msg, srv
+from aliveos_py import ConstantNamespace
+from aliveos_py.helpers.json_tools import json_to_dict, string_to_obj
+from aliveos_py.ros import get_publisher, get_server, get_subscriber, get
+
+
+class MultiLock:
+    def __init__(self):
+        self.acc_count = 0
+
+    def acquire(self):
+        self.acc_count += 1
+        return True
+
+    def release(self):
+        if self.acc_count:
+            self.acc_count -= 1
+            return True
+        return False
+
+    def locked(self):
+        return bool(self.acc_count)
+
+
+class C2C_SPECIFIC_CONCEPTS(ConstantNamespace):
+    WAIT = "wait"
+
+
+class C2C_RESPONSE(ConstantNamespace):
+    ERROR = "error"
+    OK = "ok"
+    BUSY = "busy"
+    ABORT = "abort"
 
 
 class Concept2CommandsInterpreter:
-    RESPONSE_ERROR = "error"
-    RESPONSE_OK = "ok"
-    RESPONSE_BUSY = "busy"
-    RESPONSE_ABORT = "abort"
-
-    CODE_ERROR = -1
-    CODE_OK = 0
-    CODE_BUSY = 1
-    CODE_ABORT = 2
-
     def __init__(self):
-        self.lock_consciousness = Lock()
-        self.lock_consciousness_pause = Lock()
-        self.lock_consciousness_abort = Lock()
-        self.lock_instinct = Lock()
+        self.lock_exec_ego = Lock()
+        self.lock_exec_instinct = Lock()
+        self.lockmult_exec_reflex = MultiLock()
         self.executing_reflex_concepts = []
         self.data = {}
         self.concepts = {}
 
         # Servers
-        self.server_of_command_concepts = None  # type: Union[Service, None]
-        self.server_of_command_concept_descriptors = None  # type: Union[Service, None]
+        self.srv_command_concepts = None  # type: Union[Service, None]
+        self.srv_command_concept_descriptors = None  # type: Union[Service, None]
         # Publishers
-        self.publisher_to_devices = None
-
+        self.pub_device_cmd = None
+        self.pub_ego_commands = None
         # Subscribers
-        self.subscriber_to_perception_concepts = None
+        self.sub_perception_concepts = None
 
     def publish_device_cmd(self, device: str, cmd: str, arg: str):
         to_send = msg.DeviceCmd()
         to_send.device = device
         to_send.cmd = cmd
         to_send.arg = arg
-        self.publisher_to_devices.publish(to_send)
-        logdebug(f"Send to {device}: {cmd}({arg})")
+        self.pub_device_cmd.publish(to_send)
+        logdebug(f"c2c -> dev: {device} - {cmd}({arg})")
 
-    def get_concept(self, concept: str) -> Union[list, None]:
+    def publish_ego_cmd(self, command):
+        if not EGO_COMMANDS.contains(command):
+            logerr(f"Wrong Ego Command: {command}")
+            return
+        to_send = msg.EgoCommands()
+        to_send.cmd = command
+        self.pub_ego_commands.publish(to_send)
+        logdebug(f"-> Ego command: {command}")
+
+    def get_concept_dsc(self, concept: str) -> Union[list, None]:
         c = self.concepts.get(concept)
         if c:
             return c
         logerr(f"Unknown concept: {concept}")
         return None
 
-    def exec_concept(self, concept_dsc: list, modifier: str) -> str:
+    def exec_concept(self, symbol: str, modifier: str) -> Union[str, None]:
+        """
+        Parameters
+        ----------
+        symbol : str
+            [description]
+        modifier : str
+            [description]
+
+        Returns
+        -------
+        Union[str, None]
+            [description]
+        """
         commands = None
         if modifier == "()":
             modifier = ""
+        concept_dsc = self.get_concept_dsc(symbol)
+        if not concept_dsc:
+            return None
         for c in concept_dsc:
             if c["modifier"] is modifier:
                 commands = c["commands"]
@@ -90,90 +135,86 @@ class Concept2CommandsInterpreter:
             return f"Error: {msg}"
 
         for cmd in commands:
-            self.publish_device_cmd(device=cmd["device_name"],
-                                    cmd=cmd["command"],
-                                    arg=str(cmd.get("arguments")))
-        return self.RESPONSE_OK
+            logdebug(f"c2c -> dev : {cmd}")
+            cmd_name = cmd["command"]
+            cmd_dev = cmd["device_name"]
+            cmd_args = cmd.get("arguments", "")
 
-    # TODO split into is_permisson and apply_permission
-    def take_permission(self, mind_node_type: int, concept: str) -> int:
-        """
-        Parameters
-        ----------
-        mind_node_type : int
-        concept : str
-
-        Returns
-        -------
-        int
-            code (see self.CODE_*)
-        """
-        result = self.CODE_BUSY
-
-        if mind_node_type == node_types.EGO_NODE:
-            if self.lock_consciousness_abort.locked():
-                result = self.CODE_ABORT
-            elif self.lock_consciousness.acquire(
-                    blocking=False) and not self.lock_consciousness_pause.locked():
-                result = self.CODE_OK
-        elif mind_node_type == node_types.INSTINCT_NODE:
-            self.lock_consciousness_abort.acquire(blocking=False)  # will be unlocked when the abort be sent
-            if self.lock_instinct.acquire(blocking=False):
-                result = self.CODE_OK
-        elif mind_node_type == node_types.REFLEX_NODE:
-            if concept in self.executing_reflex_concepts:  # avoiding executing the same reflex twice
-                loginfo(f"Reflex busy: {concept} in  {self.executing_reflex_concepts}")
-                result = self.CODE_BUSY
+            if C2C_SPECIFIC_CONCEPTS.contains(cmd_name):
+                cmd_method = getattr(self, f"command_{cmd_name}", None)
+                cmd_method(cmd_args)
             else:
-                loginfo("Reflex added: " + str(concept))
-                self.executing_reflex_concepts.append(concept)
-                self.lock_consciousness_pause.acquire(blocking=False)
-                logwarn(f"Acquired by {concept} (node type: {mind_node_type})")
-                result = self.CODE_OK
-        logdebug("Permission is taken with code: %d (node_type: %d)" % (result, mind_node_type))
-        return result
+                self.publish_device_cmd(device=cmd_dev, cmd=cmd_name, arg=str(cmd_args))
 
-    def release_permissions(self, mind_node_type: int, concept: str):
-        # logwarn(f"Released by {concept} (node type: {mind_node_type})")
-        if mind_node_type == node_types.EGO_NODE:
-            self.lock_consciousness.release()
-        elif mind_node_type == node_types.INSTINCT_NODE:
-            if self.lock_consciousness.locked():
-                self.lock_consciousness.release()
-            self.lock_instinct.release()
-        elif mind_node_type == node_types.REFLEX_NODE:
-            self.executing_reflex_concepts.remove(concept)
-            loginfo(f"Reflex {concept} ended. Executing now: {self.executing_reflex_concepts}")
-            if self.lock_consciousness.locked():
-                self.lock_consciousness.release()
-            self.lock_consciousness_pause.release()
+        return C2C_RESPONSE.OK
+
+    @staticmethod
+    def command_wait(mods):
+        for m in mods:
+            try:
+                value = float(m)
+                sleep(value)
+                return C2C_RESPONSE.OK
+            except ValueError:
+                pass
+        logerr("Wait concept has now duration argument!")
+        return C2C_RESPONSE.ERROR
+
+    def exec_concept_from_ego(self, symbol, mods):
+        if self.lock_exec_ego.acquire():
+            res = self.exec_concept(symbol, mods)
+            if self.lock_exec_ego.locked():
+                self.lock_exec_ego.release()
+        else:
+            res = C2C_RESPONSE.BUSY
+        return res
+
+    def pause_ego(self):
+        logdebug("pause_ego")
+        self.publish_ego_cmd(EGO_COMMANDS.PAUSE)
+
+    def reset_ego(self):
+        logdebug("reset_ego")
+        if self.lock_exec_ego.locked():
+            self.lock_exec_ego.release()
+        self.publish_ego_cmd(EGO_COMMANDS.RESET)
+
+    def unpause_ego(self):
+        logdebug("unpause_ego")
+        self.publish_ego_cmd(EGO_COMMANDS.CONTINUE)
+
+    def exec_concept_from_instinct(self, symbol, mods):
+        if self.lock_exec_instinct.acquire():
+            self.pause_ego()
+            self.reset_ego()
+            res = self.exec_concept(symbol, mods)
+            self.unpause_ego()
+            self.lock_exec_instinct.release()
+        else:
+            res = C2C_RESPONSE.BUSY
+        return res
+
+    def exec_concept_from_reflex(self, symbol, mods):
+        self.lockmult_exec_reflex.acquire()
+        res = self.exec_concept(symbol, mods)
+        self.lockmult_exec_reflex.release()
+        return res
 
     def handler_command_concept(self, req: srv.CommandConceptRequest) -> srv.CommandConceptResponse:
         res = ""
         concept = req.symbol
         mods = req.modifier
         node_type = req.ego_type
-        loginfo("Got %s, mods: %s, type: %d" % (concept, mods, node_type))
+        logdebug("mind -> c2c: %s, mods: %s, type: %d" % (concept, mods, node_type))
 
-        permission = self.take_permission(node_type, concept)
+        if node_type == node_types.EGO_NODE:
+            res = self.exec_concept_from_ego(concept, mods)
+        elif node_type == node_types.INSTINCT_NODE:
+            res = self.exec_concept_from_instinct(concept, mods)
+        elif node_type == node_types.REFLEX_NODE:
+            res = self.exec_concept_from_reflex(concept, mods)
 
-        if permission == self.CODE_OK:
-            logdebug("Object: %s; Method: %s" % (str(self), str(concept)))
-            conc_dsc = self.get_concept(concept)
-            if conc_dsc is None:
-                res = self.RESPONSE_ERROR
-            else:
-                res = self.exec_concept(conc_dsc, mods)
-            self.release_permissions(node_type, concept)
-        elif permission == self.CODE_BUSY:
-            res = f"{self.RESPONSE_BUSY} ({node_type}, {concept}, {mods}) : Ignoring the request."
-            logwarn(res)
-        elif permission == self.CODE_ABORT:
-            self.lock_consciousness_abort.release()
-            res = self.RESPONSE_ABORT
-        else:
-            res = self.RESPONSE_ERROR
-
+        res = C2C_RESPONSE.OK
         return srv.CommandConceptResponse(result=res)
 
     def handler_command_concept_descriptor(
@@ -185,32 +226,30 @@ class Concept2CommandsInterpreter:
         dsc = json_dict["descriptor"]
         if self.concepts.get(name):
             logerr(f"Command concept {name} already exists!")
-            return srv.CommandConceptDescriptorResponse(result=self.RESPONSE_ERROR)
+            return srv.CommandConceptDescriptorResponse(result=C2C_RESPONSE.ERROR)
         self.concepts[name] = dsc
-        return srv.CommandConceptDescriptorResponse(result=self.RESPONSE_OK)
+        return srv.CommandConceptDescriptorResponse(result=C2C_RESPONSE.OK)
 
-    def sensor_callback(self, data: msg.PerceptionConcept):
-        logdebug("From SensorInterpreter: %s:%s" % (data.symbol, data.modifier))
+    def handler_perception_concept(self, data: msg.PerceptionConcept):
+        logdebug("d2c -> c2c: %s:%s" % (data.symbol, data.modifier))
         self.data[data.symbol] = data.modifier
         logdebug(self.data)
 
     def init_communications(self):
-        self.publisher_to_devices = ar.get.publisher(topic_name=get_param("TOPIC_DEV_CMD"),
-                                                     data_class=msg.DeviceCmd)
-        self.server_of_command_concepts = ar.get.server(name=get_param("SRV_C2C_CMDC"),
-                                                        service=srv.CommandConcept,
-                                                        handle=self.handler_command_concept)
-        self.server_of_command_concept_descriptors = ar.get.server(
-            name=get_param("SRV_C2C_CMDDSC"),
-            service=srv.CommandConceptDescriptor,
-            handle=self.handler_command_concept_descriptor)
-        self.subscriber_to_perception_concepts = ar.get.subscriber(topic_name=get_param("TOPIC_PC"),
-                                                                   data_class=msg.PerceptionConcept,
-                                                                   callback=self.sensor_callback)
+        self.pub_device_cmd = get_publisher.device_cmd()
+        self.pub_ego_commands = get_publisher.ego_commands()
+        self.srv_command_concepts = get_server.command_concept(self.handler_command_concept)
+        self.srv_command_concept_descriptors = get_server.command_concept_descriptor(
+            self.handler_command_concept_descriptor)
+        self.sub_perception_concepts = get_subscriber.perception_concept(self.handler_perception_concept)
 
     def start(self):
         init_node(name=self.__class__.__name__, anonymous=False)
         self.init_communications()
+        while (not get.param("FLAG_EGO_READY")):
+            sleep(.1)
+            logwarn("Ego is not ready yet!")
+        self.unpause_ego()
 
 
 def start():
